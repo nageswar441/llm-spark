@@ -12,8 +12,10 @@ import os
 import sys
 import re
 import streamlit as st
+from difflib import SequenceMatcher
 
 from collections import defaultdict
+
 from openai import OpenAI
 
 
@@ -63,27 +65,117 @@ def diff_configs(old_cfg, new_cfg):
     diffs = []
     parents = set(old_cfg.keys()) | set(new_cfg.keys())
 
-    for parent in parents:
+    # Identify purely added and removed parents first
+    added_parents = [p for p in parents if p in new_cfg and p not in old_cfg]
+    removed_parents = [p for p in parents if p in old_cfg and p not in new_cfg]
+    common_parents = [p for p in parents if p in old_cfg and p in new_cfg]
+
+    # Heuristic to detect renamed/modified parents
+    # We map removed_p -> added_p if they are similar enough
+    parent_renames = {}
+
+    # We process copy of lists to modify them
+    pending_added = set(added_parents)
+    pending_removed = set(removed_parents)
+
+    for rem in removed_parents:
+        best_match = None
+        best_ratio = 0.0
+
+        for add in list(pending_added):
+            # Check for high similarity
+            # 1. Start with same word (e.g. "interface", "logging")
+            rem_tokens = rem.split()
+            add_tokens = add.split()
+
+            if not rem_tokens or not add_tokens:
+                continue
+
+            match_score = 0
+            if rem_tokens[0] == add_tokens[0]:
+                match_score += 0.4  # Bonus for same first word (command)
+
+            ratio = SequenceMatcher(None, rem, add).ratio()
+            match_score += (ratio * 0.6)
+
+            if match_score > 0.6 and match_score > best_ratio:
+                best_match = add
+                best_ratio = match_score
+
+        if best_match:
+            parent_renames[rem] = best_match
+            pending_added.remove(best_match)
+            pending_removed.remove(rem)
+
+    # Process Common Parents
+    for parent in common_parents:
         old_cmds = set(old_cfg.get(parent, []))
         new_cmds = set(new_cfg.get(parent, []))
 
         added = sorted(new_cmds - old_cmds)
         removed = sorted(old_cmds - new_cmds)
 
-        # Check if the parent itself is added or removed (for single-line commands)
-        if parent in new_cfg and parent not in old_cfg:
-            if not new_cmds:  # It's a single line command like "logging host ..."
-                added.append(parent)
-
-        if parent in old_cfg and parent not in new_cfg:
-            if not old_cmds:  # It was a single line command
-                removed.append(parent)
-
         if added or removed:
             diffs.append({
                 "parent": parent,
                 "added": added,
                 "removed": removed
+            })
+
+    # Process Renamed/Modified Parents
+    for old_p, new_p in parent_renames.items():
+        # Treat as a modification of the parent block
+        old_cmds = set(old_cfg.get(old_p, []))
+        new_cmds = set(new_cfg.get(new_p, []))
+
+        added_cmds = sorted(new_cmds - old_cmds)
+        removed_cmds = sorted(old_cmds - new_cmds)
+
+        diffs.append({
+            "parent": new_p,
+            "modified_parent_from": old_p,  # Indicator of parent modification
+            "added": added_cmds,
+            "removed": removed_cmds
+        })
+
+    # Process Remaining Added Parents
+    for parent in pending_added:
+        cmds = new_cfg.get(parent, [])
+        # If adds a block with commands, those commands are added.
+        # But if the parent itself is the command (no children), track it.
+        # Original logic:
+        # if not new_cmds: added.append(parent)
+        # We can just list all children as added.
+        # If no children, it's the parent line itself.
+
+        if not cmds:
+            # Single line command added
+            diffs.append({
+                "parent": parent,
+                "added": [parent],  # Treat self as added command
+                "removed": []
+            })
+        else:
+            diffs.append({
+                "parent": parent,
+                "added": sorted(cmds),
+                "removed": []
+            })
+
+    # Process Remaining Removed Parents
+    for parent in pending_removed:
+        cmds = old_cfg.get(parent, [])
+        if not cmds:
+            diffs.append({
+                "parent": parent,
+                "added": [],
+                "removed": [parent]
+            })
+        else:
+            diffs.append({
+                "parent": parent,
+                "added": [],
+                "removed": sorted(cmds)
             })
 
     return diffs
@@ -267,12 +359,24 @@ def summarize_diffs(diffs):
     return summary
 
 
-def get_default_prompt(
+client = OpenAI(
+    api_key="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"
+)
+
+
+def analyze_diff_with_llm(
+        diffs_data,
         vendor="Cisco",
         device_type="Switch/Router",
-        os_type="IOS"
+        os_type="IOS",
+        custom_instructions=None
 ):
-    return f"""
+    # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    diff_summary = summarize_diffs(diffs_data)
+
+    # Base instructions (Default Prompt)
+    default_instructions = f"""
 You are a senior network architect.
 
 Vendor: {vendor}
@@ -322,18 +426,17 @@ Return ONLY valid JSON.
 }}
 """
 
-
-def analyze_diff_with_llm(
-        diffs_data,
-        prompt_instructions
-):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    diff_summary = summarize_diffs(diffs_data)
+    # Use custom instructions if provided, otherwise default
+    if custom_instructions and custom_instructions.strip():
+        # If user provides custom instructions, we assume they replace the main instruction block.
+        # We will append the data context to it.
+        instruction_part = custom_instructions
+    else:
+        instruction_part = default_instructions
 
     # Append Data Context
-    final_prompt = f"""
-{prompt_instructions}
+    prompt = f"""
+{instruction_part}
 
 ### ADDED CHANGES:
 {json.dumps(diff_summary["added"], indent=2)}
@@ -349,7 +452,7 @@ def analyze_diff_with_llm(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": "Return ONLY valid JSON"},
-            {"role": "user", "content": final_prompt}
+            {"role": "user", "content": prompt}
         ],
         temperature=0
     )
@@ -407,15 +510,12 @@ def main():
         st.info("Ensure you have set the OpenAI API Key in the code or environment.")
 
         st.divider()
-        # Generate default prompt based on current settings
-        default_prompt_text = get_default_prompt(vendor, device_type, os_type)
-
         with st.expander("Advanced: Custom AI Prompt"):
             custom_prompt = st.text_area(
-                "Customize Instructions",
-                value=default_prompt_text,
-                height=400,
-                help="Edit the default prompt instructions. The configuration diff data is appended automatically."
+                "Enter custom instructions for the AI",
+                height=300,
+                placeholder="Leave empty to use the default prompt.",
+                help="This text will replace the default system instructions. The configuration diff data will be appended to your prompt automatically."
             )
 
     col1, col2 = st.columns(2)
@@ -474,7 +574,10 @@ def main():
         with st.spinner("Querying LLM for Impact Analysis..."):
             llm_analysis = analyze_diff_with_llm(
                 diffs,
-                prompt_instructions=custom_prompt
+                vendor=vendor,
+                device_type=device_type,
+                os_type=os_type,
+                custom_instructions=custom_prompt
             )
 
         # Display LLM Output
