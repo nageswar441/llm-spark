@@ -359,11 +359,6 @@ def summarize_diffs(diffs):
     return summary
 
 
-client = OpenAI(
-    api_key="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"
-)
-
-
 def analyze_diff_with_llm(
         diffs_data,
         vendor="Cisco",
@@ -371,7 +366,7 @@ def analyze_diff_with_llm(
         os_type="IOS",
         custom_instructions=None
 ):
-    # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     diff_summary = summarize_diffs(diffs_data)
 
