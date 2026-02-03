@@ -17,6 +17,10 @@ from difflib import SequenceMatcher
 from collections import defaultdict
 
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 # =========================================================
@@ -84,7 +88,6 @@ def diff_configs(old_cfg, new_cfg):
 
         for add in list(pending_added):
             # Check for high similarity
-            # 1. Start with same word (e.g. "interface", "logging")
             rem_tokens = rem.split()
             add_tokens = add.split()
 
@@ -92,13 +95,22 @@ def diff_configs(old_cfg, new_cfg):
                 continue
 
             match_score = 0
+            
+            # Check if first word matches (command type)
             if rem_tokens[0] == add_tokens[0]:
-                match_score += 0.4  # Bonus for same first word (command)
-
+                match_score += 0.4
+            
+            # Calculate string similarity
             ratio = SequenceMatcher(None, rem, add).ratio()
+            
+            # Check if one is substring/prefix of the other (common for modifications)
+            if rem in add or add in rem:
+                ratio = max(ratio, 0.7)  # Boost similarity for substring matches
+            
             match_score += (ratio * 0.6)
 
-            if match_score > 0.6 and match_score > best_ratio:
+            # Lower threshold to catch more modifications
+            if match_score > 0.5 and match_score > best_ratio:
                 best_match = add
                 best_ratio = match_score
 
@@ -112,14 +124,39 @@ def diff_configs(old_cfg, new_cfg):
         old_cmds = set(old_cfg.get(parent, []))
         new_cmds = set(new_cfg.get(parent, []))
 
-        added = sorted(new_cmds - old_cmds)
-        removed = sorted(old_cmds - new_cmds)
+        added = new_cmds - old_cmds
+        removed = old_cmds - new_cmds
+        
+        # Detect modifications: lines that changed (similar but not identical)
+        modified = []
+        remaining_added = set(added)
+        remaining_removed = set(removed)
+        
+        for old_line in list(remaining_removed):
+            for new_line in list(remaining_added):
+                # Check if lines are similar enough to be considered a modification
+                # Get the command part (first word)
+                old_tokens = old_line.split()
+                new_tokens = new_line.split()
+                
+                if old_tokens and new_tokens and old_tokens[0] == new_tokens[0]:
+                    # Same command type, different parameters = modification
+                    similarity = SequenceMatcher(None, old_line, new_line).ratio()
+                    if 0.3 < similarity < 1.0:  # Similar but not identical
+                        modified.append({
+                            "from": old_line,
+                            "to": new_line
+                        })
+                        remaining_removed.discard(old_line)
+                        remaining_added.discard(new_line)
+                        break
 
-        if added or removed:
+        if remaining_added or remaining_removed or modified:
             diffs.append({
                 "parent": parent,
-                "added": added,
-                "removed": removed
+                "added": sorted(remaining_added),
+                "removed": sorted(remaining_removed),
+                "modified": modified
             })
 
     # Process Renamed/Modified Parents
@@ -128,38 +165,64 @@ def diff_configs(old_cfg, new_cfg):
         old_cmds = set(old_cfg.get(old_p, []))
         new_cmds = set(new_cfg.get(new_p, []))
 
-        added_cmds = sorted(new_cmds - old_cmds)
-        removed_cmds = sorted(old_cmds - new_cmds)
+        added = new_cmds - old_cmds
+        removed = old_cmds - new_cmds
+        
+        # Detect modifications within renamed parent
+        modified = []
+        remaining_added = set(added)
+        remaining_removed = set(removed)
+        
+        # If parent itself changed and has no children, mark the parent as modified
+        if not old_cmds and not new_cmds:
+            modified.append({
+                "from": old_p,
+                "to": new_p
+            })
+        else:
+            # Check for modified child commands
+            for old_line in list(remaining_removed):
+                for new_line in list(remaining_added):
+                    old_tokens = old_line.split()
+                    new_tokens = new_line.split()
+                    
+                    if old_tokens and new_tokens and old_tokens[0] == new_tokens[0]:
+                        similarity = SequenceMatcher(None, old_line, new_line).ratio()
+                        if 0.3 < similarity < 1.0:
+                            modified.append({
+                                "from": old_line,
+                                "to": new_line
+                            })
+                            remaining_removed.discard(old_line)
+                            remaining_added.discard(new_line)
+                            break
 
         diffs.append({
             "parent": new_p,
             "modified_parent_from": old_p,  # Indicator of parent modification
-            "added": added_cmds,
-            "removed": removed_cmds
+            "added": sorted(remaining_added),
+            "removed": sorted(remaining_removed),
+            "modified": modified
         })
 
     # Process Remaining Added Parents
     for parent in pending_added:
         cmds = new_cfg.get(parent, [])
-        # If adds a block with commands, those commands are added.
-        # But if the parent itself is the command (no children), track it.
-        # Original logic:
-        # if not new_cmds: added.append(parent)
-        # We can just list all children as added.
-        # If no children, it's the parent line itself.
 
         if not cmds:
             # Single line command added
             diffs.append({
                 "parent": parent,
                 "added": [parent],  # Treat self as added command
-                "removed": []
+                "removed": [],
+                "modified": []
             })
         else:
             diffs.append({
                 "parent": parent,
                 "added": sorted(cmds),
-                "removed": []
+                "removed": [],
+                "modified": []
             })
 
     # Process Remaining Removed Parents
@@ -169,13 +232,15 @@ def diff_configs(old_cfg, new_cfg):
             diffs.append({
                 "parent": parent,
                 "added": [],
-                "removed": [parent]
+                "removed": [parent],
+                "modified": []
             })
         else:
             diffs.append({
                 "parent": parent,
                 "added": [],
-                "removed": sorted(cmds)
+                "removed": sorted(cmds),
+                "modified": []
             })
 
     return diffs
@@ -277,7 +342,7 @@ def build_impact_report(diffs):
     for diff in diffs:
         parent = diff["parent"]
 
-        for cmd in diff["added"]:
+        for cmd in diff.get("added", []):
             # If the command is the same as parent, it means it's a top-level command
             # We treat the 'command' argument to semantic_impact as the full line for matching
             target_cmd = cmd if cmd != parent else parent
@@ -296,7 +361,7 @@ def build_impact_report(diffs):
                 "rollback": generate_rollback(cmd, "ADDED")
             })
 
-        for cmd in diff["removed"]:
+        for cmd in diff.get("removed", []):
             target_cmd = cmd if cmd != parent else parent
 
             domain, impact, reason = semantic_impact(parent, target_cmd)
@@ -311,6 +376,23 @@ def build_impact_report(diffs):
                 "impact": impact,
                 "reason": reason,
                 "rollback": generate_rollback(cmd, "REMOVED")
+            })
+        
+        for mod in diff.get("modified", []):
+            target_cmd = mod["to"]
+
+            domain, impact, reason = semantic_impact(parent, target_cmd)
+            summary[impact] += 1
+            total_risk += IMPACT_SCORE[impact]
+
+            changes.append({
+                "parent": parent,
+                "command": f"{mod['from']} → {mod['to']}",
+                "change_type": "MODIFIED",
+                "domain": domain,
+                "impact": impact,
+                "reason": reason,
+                "rollback": mod['from']  # Rollback to original value
             })
 
     risk_level = (
@@ -336,6 +418,14 @@ def summarize_diffs(diffs):
 
     for diff in diffs:
         parent = diff["parent"]
+
+        # Check if parent itself was modified (renamed)
+        if "modified_parent_from" in diff:
+            summary["modified"].append({
+                "parent": parent,
+                "from": diff["modified_parent_from"],
+                "to": parent
+            })
 
         for cmd in diff.get("added", []):
             summary["added"].append({
@@ -366,7 +456,15 @@ def analyze_diff_with_llm(
         os_type="IOS",
         custom_instructions=None
 ):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Validate API key before proceeding
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "error": "OpenAI API key not configured",
+            "raw_output": "Please set the OPENAI_API_KEY environment variable in your .env file or system environment."
+        }
+    
+    client = OpenAI(api_key=api_key)
 
     diff_summary = summarize_diffs(diffs_data)
 
